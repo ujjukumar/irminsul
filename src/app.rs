@@ -3,26 +3,39 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::thread;
-use std::time::Instant;
 
 use anyhow::{Context as _, Result, anyhow};
-use chrono::Local;
+use chrono::{DateTime, Local};
 use egui::{
-    Button, Color32, Context, DragValue, Id, Key, KeyboardShortcut, Modal, Modifiers, OpenUrl,
-    PointerButton, RichText, Sense, ViewportCommand,
+    Align, Button, Color32, Context, DragValue, Id, Key, KeyboardShortcut, Label, Layout, Modal,
+    Modifiers, OpenUrl, PointerButton, Rect, RichText, ScrollArea, Sense, UiBuilder,
+    ViewportCommand,
 };
 use egui_file_dialog::FileDialog;
+use egui_material_icons::icons;
 use egui_notify::Toasts;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::accounts::{AccountId, AccountSummary, DataKind, DataSummary};
+use crate::activity::{self, format_count};
 use crate::monitor::Monitor;
 use crate::player_data::ExportSettings;
 use crate::update::check_for_app_update;
 use crate::{
-    AppState, ConfirmationType, Message, ReloadHandle, State, TracingLevel, admin, capture,
-    open_log_dir, wish,
+    AppState, ConfirmationType, LinkStatus, Message, ReloadHandle, State, TracingLevel, admin,
+    capture, open_log_dir, wish,
 };
+
+const INFO_COLOR: Color32 = Color32::from_gray(170);
+const HINT_COLOR: Color32 = Color32::from_gray(185);
+const SUCCESS_COLOR: Color32 = Color32::from_rgb(0x00, 0xab, 0x3f);
+const WARNING_COLOR: Color32 = Color32::from_rgb(0xf0, 0xb4, 0x29);
+const ERROR_COLOR: Color32 = Color32::from_rgb(0xef, 0x53, 0x50);
+
+/// Where the activity panel sits over the background art, below its title.
+const ACTIVITY_PANEL_MIN: egui::Pos2 = egui::pos2(12., 110.);
+const ACTIVITY_PANEL_MAX: egui::Pos2 = egui::pos2(505., 470.);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SavedAppState {
@@ -81,9 +94,18 @@ pub struct IrminsulApp {
 
     capture_settings_open: bool,
 
+    /// The account Genshin Optimizer exports are made from.
+    selected_account: Option<AccountId>,
+    /// The latest capture the account selection has followed.
+    seen_last_capture: Option<(AccountId, DateTime<Local>)>,
+    /// An account waiting for confirmation before being forgotten.
+    forget_account: Option<AccountId>,
+
     optimizer_settings_open: bool,
     optimizer_export_rx: Option<oneshot::Receiver<Result<String>>>,
+    optimizer_export_account: Option<AccountId>,
     optimizer_save_dialog: Option<FileDialog>,
+    optimizer_save_account: Option<AccountId>,
     optimizer_save_path: Option<PathBuf>,
     optimizer_export_target: OptimizerExportTarget,
 
@@ -101,7 +123,7 @@ impl<T, E: Display> ToastError<T> for std::result::Result<T, E> {
         match self {
             Ok(val) => Some(val),
             Err(e) => {
-                tracing::error!("{e}");
+                activity::error(e.to_string());
                 app.toasts.error(e.to_string());
                 None
             }
@@ -184,6 +206,7 @@ impl IrminsulApp {
     ) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         egui_material_icons::initialize(&cc.egui_ctx);
+        activity::set_repaint_context(cc.egui_ctx.clone());
 
         let saved_state: SavedAppState = if let Some(storage) = cc.storage {
             eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default()
@@ -202,7 +225,11 @@ impl IrminsulApp {
             }
         }
 
-        let toasts = Toasts::default().with_anchor(egui_notify::Anchor::BottomLeft);
+        // Bottom left is taken by the activity panel.  The margin keeps toasts
+        // clear of the footer.
+        let toasts = Toasts::default()
+            .with_anchor(egui_notify::Anchor::BottomRight)
+            .with_margin(egui::vec2(8., 32.));
 
         Self {
             saved_state,
@@ -213,9 +240,14 @@ impl IrminsulApp {
             power_tools_open: false,
             bug_report_open: false,
             capture_settings_open: false,
+            selected_account: None,
+            seen_last_capture: None,
+            forget_account: None,
             optimizer_settings_open: false,
             optimizer_export_rx: None,
+            optimizer_export_account: None,
             optimizer_save_dialog: None,
+            optimizer_save_account: None,
             optimizer_save_path: None,
             optimizer_export_target: OptimizerExportTarget::None,
             restarting: false,
@@ -248,6 +280,7 @@ impl eframe::App for IrminsulApp {
                 egui::Image::new(egui::include_image!("../assets/background.webp"))
                     .paint_at(ui, ui.ctx().screen_rect());
             });
+            self.activity_panel(ui);
 
             ui.vertical(|ui| {
                 self.title_bar(ui);
@@ -504,6 +537,8 @@ impl IrminsulApp {
     }
 
     fn main_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
+        self.sync_selected_account(app_state);
+
         if self.capture_settings_open {
             let modal = Modal::new(Id::new("Capture Settings")).show(ui.ctx(), |ui| {
                 self.capture_settings_modal(ui);
@@ -521,6 +556,16 @@ impl IrminsulApp {
                 self.optimizer_settings_open = false;
             }
         }
+
+        if let Some(id) = self.forget_account {
+            let modal = Modal::new(Id::new("Forget Account")).show(ui.ctx(), |ui| {
+                self.forget_account_modal(ui, id);
+            });
+            if modal.should_close() {
+                self.forget_account = None;
+            }
+        }
+
         self.capture_ui(ui, app_state);
         ui.separator();
         self.genshin_optimizer_ui(ui, app_state);
@@ -528,6 +573,33 @@ impl IrminsulApp {
         self.wish_ui(ui);
         ui.separator();
         self.achievement_ui(ui, app_state);
+    }
+
+    /// Selects the account that was just captured, so exporting right after
+    /// a capture exports that account.
+    fn sync_selected_account(&mut self, app_state: &AppState) {
+        if app_state.last_capture != self.seen_last_capture {
+            self.seen_last_capture = app_state.last_capture;
+            if let Some((id, _)) = app_state.last_capture {
+                self.selected_account = Some(id);
+            }
+        }
+
+        let selection_exists = self
+            .selected_account
+            .is_some_and(|id| app_state.accounts.iter().any(|account| account.id == id));
+        if !selection_exists {
+            self.selected_account = app_state
+                .accounts
+                .iter()
+                .max_by_key(|account| account.last_captured())
+                .map(|account| account.id);
+        }
+    }
+
+    fn selected_account<'a>(&self, app_state: &'a AppState) -> Option<&'a AccountSummary> {
+        let id = self.selected_account?;
+        app_state.accounts.iter().find(|account| account.id == id)
     }
 
     fn capture_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
@@ -558,30 +630,150 @@ impl IrminsulApp {
                 },
             );
         });
-        egui::Grid::new("capture_stats")
-            .striped(false)
-            .num_columns(2)
-            .min_col_width(0.)
-            .show(ui, |ui| {
-                Self::data_state(ui, "Items", app_state.updated.items_updated);
-                Self::data_state(ui, "Characters", app_state.updated.characters_updated);
-                Self::data_state(ui, "Achievements", app_state.updated.achievements_updated);
-            });
+        Self::link_status_ui(ui, app_state.link);
+        ui.add_space(4.);
+        self.accounts_ui(ui, app_state);
     }
 
-    fn data_state(ui: &mut egui::Ui, source: &str, last_updated: Option<Instant>) {
-        let updated_icon = match last_updated {
-            Some(_) => RichText::new(egui_material_icons::icons::ICON_CHECK_CIRCLE)
-                .color(Color32::from_hex("#00ab3f").unwrap()),
-            None => RichText::new(egui_material_icons::icons::ICON_CHECK_INDETERMINATE_SMALL),
+    fn link_status_ui(ui: &mut egui::Ui, link: LinkStatus) {
+        let (icon, text, color) = match link {
+            LinkStatus::Stopped => (
+                icons::ICON_RADIO_BUTTON_UNCHECKED,
+                "Not capturing",
+                INFO_COLOR,
+            ),
+            LinkStatus::WaitingForGame => (
+                icons::ICON_HOURGLASS_EMPTY,
+                "Waiting for Genshin to connect",
+                INFO_COLOR,
+            ),
+            LinkStatus::MissedLogin => (
+                icons::ICON_WARNING,
+                "Missed the login, relaunch Genshin",
+                WARNING_COLOR,
+            ),
+            LinkStatus::Connecting => (icons::ICON_SYNC, "Genshin is connecting", INFO_COLOR),
+            LinkStatus::LoggingIn => (icons::ICON_SYNC, "Login seen, finding key", INFO_COLOR),
+            LinkStatus::Decrypting => (
+                icons::ICON_CHECK_CIRCLE,
+                "Decrypting game traffic",
+                SUCCESS_COLOR,
+            ),
+            LinkStatus::DecryptFailed => (
+                icons::ICON_ERROR,
+                "Can't decrypt, see activity log",
+                ERROR_COLOR,
+            ),
+            LinkStatus::CaptureFailed => (
+                icons::ICON_ERROR,
+                "Capture failed, see activity log",
+                ERROR_COLOR,
+            ),
         };
-        ui.label(updated_icon);
-        ui.label(source);
-        ui.end_row();
+        ui.label(RichText::new(format!("{icon} {text}")).color(color));
+    }
+
+    fn accounts_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
+        if app_state.accounts.is_empty() {
+            ui.label(RichText::new("No account data captured yet").weak());
+            return;
+        }
+
+        for account in &app_state.accounts {
+            egui::Sides::new().show(
+                ui,
+                |ui| {
+                    ui.radio_value(
+                        &mut self.selected_account,
+                        Some(account.id),
+                        account.id.to_string(),
+                    )
+                    .on_hover_text("Export this account to Genshin Optimizer");
+                },
+                |ui| {
+                    if ui
+                        .small_button(icons::ICON_DELETE)
+                        .on_hover_text("Forget this account's captured data")
+                        .clicked()
+                    {
+                        self.forget_account = Some(account.id);
+                    }
+                },
+            );
+            ui.horizontal(|ui| {
+                ui.add_space(24.);
+                Self::data_badge(ui, icons::ICON_PERSON, DataKind::Characters, account);
+                Self::data_badge(ui, icons::ICON_BACKPACK, DataKind::Items, account);
+                Self::data_badge(ui, icons::ICON_TROPHY, DataKind::Achievements, account);
+                if let Some(last_captured) = account.last_captured() {
+                    ui.label(
+                        RichText::new(format_capture_time(last_captured))
+                            .size(12.)
+                            .weak(),
+                    )
+                    .on_hover_text(format!(
+                        "Last captured {}",
+                        last_captured.format("%b %-d, %H:%M")
+                    ));
+                }
+            });
+        }
+    }
+
+    fn data_badge(ui: &mut egui::Ui, icon: &str, kind: DataKind, account: &AccountSummary) {
+        let data: Option<DataSummary> = account.get(kind);
+        let (text, tooltip) = match data {
+            Some(data) => (
+                RichText::new(format!("{icon} {}", format_count(data.count))).size(12.),
+                format!(
+                    "{} {} captured {}",
+                    format_count(data.count),
+                    kind.noun(),
+                    data.captured_at.format("%b %-d, %H:%M")
+                ),
+            ),
+            None => (
+                RichText::new(format!("{icon} -")).size(12.).weak(),
+                format!("No {} captured yet", kind.noun()),
+            ),
+        };
+        ui.label(text).on_hover_text(tooltip);
+    }
+
+    fn forget_account_modal(&mut self, ui: &mut egui::Ui, id: AccountId) {
+        ui.set_width(300.0);
+        ui.heading("Forget Account");
+        ui.separator();
+        ui.label(format!(
+            "Forget the captured data for {id}?  It will need to be captured again before it can be exported."
+        ));
+        ui.separator();
+        egui::Sides::new().show(
+            ui,
+            |_ui| {},
+            |ui| {
+                if ui.button("Forget").clicked() {
+                    let _ = self.ui_message_tx.send(Message::ForgetAccount(id));
+                    ui.close()
+                }
+                if ui.button("Cancel").clicked() {
+                    ui.close()
+                }
+            },
+        );
     }
 
     fn genshin_optimizer_ui(&mut self, ui: &mut egui::Ui, app_state: &AppState) {
         self.optimizer_handle_export(ui).toast_error(self);
+
+        let selected = self.selected_account(app_state);
+        let export_account = selected
+            .filter(|account| account.can_export_optimizer())
+            .map(|account| account.id);
+        let disabled_reason = match selected {
+            None => "Capture an account first".to_string(),
+            Some(account) => format!("{} is missing characters or items", account.id),
+        };
 
         ui.vertical(|ui| {
             egui::Sides::new().show(
@@ -598,37 +790,51 @@ impl IrminsulApp {
                     }
 
                     ui.add_enabled_ui(
-                        app_state.updated.characters_updated.is_some()
-                            && app_state.updated.items_updated.is_some()
-                            && self.optimizer_export_rx.is_none(),
+                        export_account.is_some() && self.optimizer_export_rx.is_none(),
                         |ui| {
+                            let target =
+                                export_account.map(|id| id.to_string()).unwrap_or_default();
+
                             if ui
                                 .button(egui_material_icons::icons::ICON_DOWNLOAD)
+                                .on_hover_text(format!("Save {target} to a file"))
+                                .on_disabled_hover_text(&disabled_reason)
                                 .clicked()
+                                && let Some(id) = export_account
                             {
                                 let now = Local::now();
                                 let mut optimizer_save_dialog = FileDialog::new()
                                     .add_file_filter_extensions("JSON files", vec!["json"])
                                     .default_file_name(&format!(
-                                        "genshin_export_{}.json",
+                                        "genshin_export_{}_{}.json",
+                                        id.file_tag(),
                                         now.format("%Y-%m-%d_%H-%M")
                                     ));
                                 optimizer_save_dialog.save_file();
                                 self.optimizer_save_dialog = Some(optimizer_save_dialog);
+                                self.optimizer_save_account = Some(id);
                             }
 
                             if let Some(optimizer_save_dialog) = &mut self.optimizer_save_dialog
                                 && let Some(path) = optimizer_save_dialog.take_picked()
+                                && let Some(id) = self.optimizer_save_account.take()
                             {
                                 self.optimizer_save_path = Some(path);
-                                self.genshin_optimizer_request_export(OptimizerExportTarget::File);
+                                self.genshin_optimizer_request_export(
+                                    id,
+                                    OptimizerExportTarget::File,
+                                );
                             }
 
                             if ui
                                 .button(egui_material_icons::icons::ICON_CONTENT_PASTE_GO)
+                                .on_hover_text(format!("Copy {target} to the clipboard"))
+                                .on_disabled_hover_text(&disabled_reason)
                                 .clicked()
+                                && let Some(id) = export_account
                             {
                                 self.genshin_optimizer_request_export(
+                                    id,
                                     OptimizerExportTarget::Clipboard,
                                 );
                             }
@@ -639,14 +845,16 @@ impl IrminsulApp {
         });
     }
 
-    fn genshin_optimizer_request_export(&mut self, target: OptimizerExportTarget) {
+    fn genshin_optimizer_request_export(&mut self, id: AccountId, target: OptimizerExportTarget) {
         let (tx, rx) = oneshot::channel();
         let _ = self.ui_message_tx.send(Message::ExportGenshinOptimizer(
+            id,
             self.saved_state.export_settings.clone(),
             tx,
         ));
         self.optimizer_export_target = target;
         self.optimizer_export_rx = Some(rx);
+        self.optimizer_export_account = Some(id);
     }
 
     fn wish_ui(&mut self, ui: &mut egui::Ui) {
@@ -903,16 +1111,21 @@ impl IrminsulApp {
         };
 
         let json = rx.blocking_recv()??;
+        let account = self
+            .optimizer_export_account
+            .take()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "Genshin Optimizer data".to_string());
 
         match self.optimizer_export_target {
             OptimizerExportTarget::None => {
                 tracing::warn!("Unexpected json export");
             }
             OptimizerExportTarget::Clipboard => {
-                self.optimizer_save_to_clipboard(ui, json)?;
+                self.optimizer_save_to_clipboard(ui, json, &account)?;
             }
             OptimizerExportTarget::File => {
-                self.optimizer_save_to_file(json)?;
+                self.optimizer_save_to_file(json, &account)?;
             }
         }
 
@@ -920,14 +1133,21 @@ impl IrminsulApp {
         Ok(())
     }
 
-    fn optimizer_save_to_clipboard(&mut self, ui: &mut egui::Ui, json: String) -> Result<()> {
+    fn optimizer_save_to_clipboard(
+        &mut self,
+        ui: &mut egui::Ui,
+        json: String,
+        account: &str,
+    ) -> Result<()> {
         ui.ctx().copy_text(json);
-        self.toasts
-            .info("Genshin Optimizer data copied to clipboard");
+        self.toasts.info(format!("{account} copied to clipboard"));
+        activity::success(format!(
+            "Copied {account} to the clipboard for Genshin Optimizer"
+        ));
         Ok(())
     }
 
-    fn optimizer_save_to_file(&mut self, json: String) -> Result<()> {
+    fn optimizer_save_to_file(&mut self, json: String, account: &str) -> Result<()> {
         let path = self
             .optimizer_save_path
             .take()
@@ -937,7 +1157,8 @@ impl IrminsulApp {
         let mut writer = BufWriter::new(file);
         writer.write_all(json.as_bytes())?;
 
-        self.toasts.info("Genshin Optimizer data saved to file");
+        self.toasts.info(format!("{account} saved to file"));
+        activity::success(format!("Saved {account} to {}", path.display()));
         Ok(())
     }
 
@@ -948,5 +1169,106 @@ impl IrminsulApp {
 
     fn section_header(ui: &mut egui::Ui, name: &str) {
         ui.label(RichText::new(name).size(18.));
+    }
+
+    /// A log of what Irminsul is doing, drawn over the background art.
+    fn activity_panel(&mut self, ui: &mut egui::Ui) {
+        let rect = Rect::from_min_max(ACTIVITY_PANEL_MIN, ACTIVITY_PANEL_MAX);
+        ui.painter()
+            .rect_filled(rect, 8., Color32::from_black_alpha(170));
+
+        let mut ui = ui.new_child(
+            UiBuilder::new()
+                .id_salt("activity_panel")
+                .max_rect(rect.shrink(10.))
+                .layout(Layout::top_down(Align::LEFT)),
+        );
+
+        egui::Sides::new().show(
+            &mut ui,
+            |ui| {
+                Self::section_header(ui, "Activity");
+            },
+            |ui| {
+                if ui
+                    .button(icons::ICON_FOLDER_OPEN)
+                    .on_hover_text("Open the detailed log folder")
+                    .clicked()
+                {
+                    thread::spawn(|| {
+                        let _ = open_log_dir();
+                    });
+                }
+                if ui
+                    .button(icons::ICON_DELETE_SWEEP)
+                    .on_hover_text("Clear the activity log")
+                    .clicked()
+                {
+                    activity::clear();
+                }
+            },
+        );
+        ui.separator();
+
+        let entries = activity::entries();
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(&mut ui, |ui| {
+                if entries.is_empty() {
+                    ui.label(RichText::new("Nothing has happened yet").weak());
+                }
+                for entry in &entries {
+                    Self::activity_entry(ui, entry);
+                }
+            });
+    }
+
+    fn activity_entry(ui: &mut egui::Ui, entry: &activity::Entry) {
+        let (icon, color) = match entry.level {
+            activity::Level::Info => (icons::ICON_INFO, INFO_COLOR),
+            activity::Level::Success => (icons::ICON_CHECK_CIRCLE, SUCCESS_COLOR),
+            activity::Level::Warning => (icons::ICON_WARNING, WARNING_COLOR),
+            activity::Level::Error => (icons::ICON_ERROR, ERROR_COLOR),
+        };
+
+        let mut message = RichText::new(if entry.repeats > 1 {
+            format!("{} (×{})", entry.message, entry.repeats)
+        } else {
+            entry.message.clone()
+        });
+        if matches!(
+            entry.level,
+            activity::Level::Warning | activity::Level::Error
+        ) {
+            message = message.color(color);
+        }
+
+        ui.horizontal_top(|ui| {
+            ui.label(
+                RichText::new(entry.time.format("%H:%M:%S").to_string())
+                    .monospace()
+                    .size(11.)
+                    .weak(),
+            );
+            ui.label(RichText::new(icon).color(color));
+            ui.vertical(|ui| {
+                ui.add(Label::new(message).wrap());
+                if let Some(hint) = &entry.hint {
+                    ui.add(Label::new(RichText::new(hint).size(12.).color(HINT_COLOR)).wrap());
+                }
+            });
+        });
+        ui.add_space(2.);
+    }
+}
+
+/// A short capture time: the time of day for today's captures, otherwise
+/// the date.
+fn format_capture_time(time: DateTime<Local>) -> String {
+    if time.date_naive() == Local::now().date_naive() {
+        time.format("%H:%M").to_string()
+    } else {
+        time.format("%b %-d").to_string()
     }
 }

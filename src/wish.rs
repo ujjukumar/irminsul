@@ -153,6 +153,7 @@ impl Wish {
         validate_url(&url).await?;
 
         tracing::info!("found {url}");
+        crate::activity::success("Found the wish history URL. It's ready to copy.");
         self.prev_url = url.to_string();
         let _ = self.url_tx.send(Some(url));
 

@@ -2,9 +2,9 @@
 
 use std::fmt::Display;
 use std::path::PathBuf;
-use std::time::Instant;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Local};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -12,11 +12,15 @@ use tracing_appender::rolling::Rotation;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, reload};
 
+use crate::accounts::{AccountId, AccountSummary};
 use crate::player_data::ExportSettings;
 
+mod accounts;
+mod activity;
 mod admin;
 mod app;
 mod capture;
+mod decoder_events;
 mod good;
 mod monitor;
 mod player_data;
@@ -55,37 +59,32 @@ pub enum Message {
     DownloadAcknowledged,
     StartCapture,
     StopCapture,
-    ExportGenshinOptimizer(ExportSettings, oneshot::Sender<Result<String>>),
+    ExportGenshinOptimizer(AccountId, ExportSettings, oneshot::Sender<Result<String>>),
+    ForgetAccount(AccountId),
 }
 
-#[derive(Clone, Debug)]
-pub struct DataUpdated {
-    achievements_updated: Option<Instant>,
-    characters_updated: Option<Instant>,
-    items_updated: Option<Instant>,
-}
-
-impl DataUpdated {
-    pub fn new() -> Self {
-        Self {
-            achievements_updated: None,
-            characters_updated: None,
-            items_updated: None,
-        }
-    }
-}
-
-impl Default for DataUpdated {
-    fn default() -> Self {
-        Self::new()
-    }
+/// How far along decoding the game's connection is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkStatus {
+    Stopped,
+    WaitingForGame,
+    /// Genshin was already connected when capture started.
+    MissedLogin,
+    Connecting,
+    LoggingIn,
+    Decrypting,
+    DecryptFailed,
+    CaptureFailed,
 }
 
 #[derive(Clone, Debug)]
 pub struct AppState {
     state: State,
     capturing: bool,
-    updated: DataUpdated,
+    link: LinkStatus,
+    accounts: Vec<AccountSummary>,
+    /// The account that most recently received captured data, and when.
+    last_capture: Option<(AccountId, DateTime<Local>)>,
 }
 
 impl AppState {
@@ -93,7 +92,9 @@ impl AppState {
         AppState {
             state: State::Starting,
             capturing: false,
-            updated: DataUpdated::new(),
+            link: LinkStatus::Stopped,
+            accounts: Vec::new(),
+            last_capture: None,
         }
     }
 }
@@ -223,12 +224,15 @@ fn tracing_init() -> Result<(tracing_appender::non_blocking::WorkerGuard, Reload
 
     let filter = EnvFilter::new(TracingLevel::default().get_filter());
     let (filter, reload_handle) = reload::Layer::new(filter);
+    // The level filter applies to the log file only, so the decoder events
+    // the activity panel relies on are seen whatever the log level is.
     let writer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking_appender)
-        .with_ansi(false);
+        .with_ansi(false)
+        .with_filter(filter);
     tracing_subscriber::registry()
-        .with(filter)
         .with(writer)
+        .with(decoder_events::layer())
         .init();
     tracing::info!("Tracing initialized and logging to file.");
 

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anime_game_data::{AnimeGameData, Property, SkillType};
 use anyhow::Result;
@@ -31,7 +32,7 @@ pub struct ExportSettings {
 }
 
 pub struct PlayerData {
-    game_data: AnimeGameData,
+    game_data: Arc<AnimeGameData>,
     achievements: Vec<Achievement>,
     characters: Vec<AvatarInfo>,
     items: Vec<Item>,
@@ -40,7 +41,7 @@ pub struct PlayerData {
 }
 
 impl PlayerData {
-    pub fn new(game_data: AnimeGameData) -> Self {
+    pub fn new(game_data: Arc<AnimeGameData>) -> Self {
         Self {
             game_data,
             achievements: Vec::new(),
