@@ -1,6 +1,6 @@
 [package]
 name = "irminsul"
-version = "3.0.0-test"
+version = "0.3.0"
 authors = ["Konkers <konkers@konkers.net>"]
 edition = "2024"
 include = ["LICENSE-APACHE", "LICENSE-MIT", "**/*.rs", "Cargo.toml"]
@@ -95,6 +95,13 @@ static-libpcap = ["pcap"]
 
 [profile.release]
 opt-level = 2 # fast and small wasm
+
+# Published builds: slower to compile, faster to run.
+[profile.dist]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
 
 # Optimize all dependencies even in debug builds:
 [profile.dev.package."*"]

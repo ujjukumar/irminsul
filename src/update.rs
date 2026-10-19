@@ -14,7 +14,7 @@ pub fn check_for_new_version() -> Result<Option<Release>> {
     // This needs to be outside of an async context otherwise it panics.
     let releases = thread::spawn(move || -> Result<Vec<Release>> {
         let releases = self_update::backends::github::ReleaseList::configure()
-            .repo_owner("konkers")
+            .repo_owner("ujjukumar")
             .repo_name("irminsul")
             .build()?
             .fetch()?;
@@ -254,6 +254,17 @@ mod tests {
         assert_eq!(asset.name, "irminsul-linux-x64");
         #[cfg(target_os = "macos")]
         assert_eq!(asset.name, "irminsul-macos-arm64");
+    }
+
+    /// Builds of main only publish a Windows binary and its checksums.  Keep
+    /// in sync with the publish job in .github/workflows/rust.yml.
+    #[cfg(windows)]
+    #[test]
+    fn picks_the_exe_from_a_main_build() {
+        let release = release(&["SHA256SUMS.txt", "irminsul-windows-x64.exe"]);
+        let asset = asset_for_target(&release).expect("an asset for this platform");
+
+        assert_eq!(asset.name, "irminsul-windows-x64.exe");
     }
 
     #[test]

@@ -5,6 +5,7 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -72,3 +73,87 @@ jobs:
         with:
           name: ${{ matrix.alternate_artifact }}
           path: target/release/irminsul${{ matrix.suffix }}
+
+  # Optimized Windows build of main.  Built alongside the test matrix and only
+  # published once that passes.
+  build-dist:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-dist-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-dist-
+      # Give every build its own version, e.g. 0.3.0-build.42, so the in-app
+      # updater can tell builds apart.  The change is never committed.
+      - name: Set build version
+        id: version
+        shell: pwsh
+        run: |
+          $text = [IO.File]::ReadAllText("Cargo.toml")
+          $base = [regex]::Match($text, '(?m)^version = "([^"]*)"').Groups[1].Value
+          $version = "$base-build.${{ github.run_number }}"
+          $text = [regex]::new('(?m)^version = "[^"]*"').Replace($text, "version = `"$version`"", 1)
+          [IO.File]::WriteAllText("Cargo.toml", $text)
+          cargo update --package irminsul
+          "version=$version" >> $env:GITHUB_OUTPUT
+      # Building for an explicit target keeps RUSTFLAGS away from build
+      # scripts.  x86-64-v3 enables AVX2, and a static CRT drops the
+      # dependency on the Visual C++ redistributable.
+      - name: Build
+        run: cargo build --profile dist --locked --target x86_64-pc-windows-msvc
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v3 -C target-feature=+crt-static
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/dist/irminsul.exe dist/irminsul-windows-x64.exe
+          $hash = (Get-FileHash dist/irminsul-windows-x64.exe -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("dist/SHA256SUMS.txt", "$hash  irminsul-windows-x64.exe`n")
+      - uses: actions/upload-artifact@v6
+        with:
+          name: irminsul-windows-avx2
+          path: dist/
+
+  # Assets must stay in sync with picks_the_exe_from_a_main_build in
+  # src/update.rs.
+  publish:
+    needs: [test_matrix, build-dist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-${{ github.ref }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: irminsul-windows-avx2
+          path: dist
+      - name: Write release notes
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message || 'manual build' }}
+        run: |
+          {
+            echo "Built from ${GITHUB_SHA::7}: $(printf '%s\n' "$COMMIT_MESSAGE" | head -n 1)"
+            echo
+            echo "Optimized Windows build.  Needs a CPU with AVX2 (Intel Haswell, AMD Zen, or newer)."
+          } > notes.md
+      - uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ needs.build-dist.outputs.version }}
+          name: v${{ needs.build-dist.outputs.version }}
+          commit: ${{ github.sha }}
+          bodyFile: notes.md
+          generateReleaseNotes: true
+          makeLatest: true
+          allowUpdates: true
+          artifacts: dist/irminsul-windows-x64.exe,dist/SHA256SUMS.txt
