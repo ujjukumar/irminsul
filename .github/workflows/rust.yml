@@ -92,7 +92,7 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-dist-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-dist-
-      # Give every build its own version, e.g. 0.3.0-build.42, so the in-app
+      # Give every build its own version, e.g. 3.0.0-build.42, so the in-app
       # updater can tell builds apart.  The change is never committed.
       - name: Set build version
         id: version
