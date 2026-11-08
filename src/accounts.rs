@@ -526,7 +526,8 @@ mod tests {
             varint_field(1, 104_000 + sequence as u64, &mut item);
             varint_field(2, guid(uid, sequence), &mut item);
             bytes_field(5, &material, &mut item);
-            bytes_field(6, &item, &mut packet);
+            // PacketWithItems.items = 2 since 7.2 (was 6).
+            bytes_field(2, &item, &mut packet);
         }
         packet
     }
@@ -538,7 +539,8 @@ mod tests {
             let mut avatar = Vec::new();
             varint_field(1, 10_000_001 + sequence as u64, &mut avatar);
             varint_field(2, guid(uid, 1000 + sequence), &mut avatar);
-            bytes_field(7, &avatar, &mut packet);
+            // AvatarDataNotify.avatar_list = 6 since 7.2 (was 7).
+            bytes_field(6, &avatar, &mut packet);
         }
         packet
     }
